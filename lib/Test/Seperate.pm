@@ -24,7 +24,10 @@ fear that something you do will effect a test in another set.
     use warnings;
 
     use Test::More tests => 5;
-    use Test::Seperate;
+    # 'all' as first param is essentially 'Test::More' => \@Test::More::EXPORT;
+    # and will make all the exported functions in Test::More work in forked
+    # processes.
+    use Test::Seperate 'all', 'Test::Something' => [qw/ something_ok nothing_ok /];
 
     # Counts as 2 tests, the ok() within, and seperate_tests() itself.
     seperate_tests { ok( 1, "a test that has been seperated" ) } "A seperate test";
@@ -62,13 +65,28 @@ appropreat tests using the values provided from the child.
 
 #}}}
 
-use base 'Exporter';
+use Exporter;
 use Test::More;
 use Data::Dumper;
 
-our @EXPORT = qw/seperate_tests/;
+our @EXPORT = qw/seperate_tests make_test_fork_safe make_tests_fork_safe/;
 our $SEPERATOR = 'EODATA';
-our $VERSION = "0.001";
+our $VERSION = "0.002";
+our $STATE = 'parent';
+our %OVERRIDES;
+pipe( READ, WRITE ) || die( $! );
+
+sub import {
+    my ( $class, @params ) = @_;
+    my ( $caller ) = caller();
+    if ( @params and $params[0] eq 'all' ) {
+        shift( @params );
+        make_tests_fork_safe( 'Test::More' => \@Test::More::EXPORT, 'caller' => $caller );
+    }
+    make_tests_fork_safe( @params, 'caller' => $caller ) if @params;
+    pop( @_ ) while ( @_ > 1 );
+    goto &Exporter::import;
+}
 
 =item seperate_tests( sub { ok( 1, 'test' ); ... }, $message )
 
@@ -84,69 +102,117 @@ filename and line number.
 sub seperate_tests(&;$) {
     my ($sub, $message) = @_;
     my ( $caller ) = caller();
-    pipe( READ, WRITE );
 
     if ( my $pid = fork()) {
-        local $/ = $SEPERATOR;
-        my $tests = <READ>;
+        my $data = _read();
         waitpid( $pid, 0 );
         my $out = !$?;
-        _run_tests( $tests );
+        _run_tests( $data );
         ok( $out, $message );
     }
     else {
-        my $tests = {};
-        _override_test_more($caller, $tests);
+        $STATE = 'child';
         $sub->();
-        print WRITE Dumper( $tests );
-        print WRITE 'EODATA';
-        close( WRITE );
+        _write( $SEPERATOR );
         exit;
     }
-    close( READ );
-    close( WRITE );
 }
 
-sub _override_test_more {
-    my ( $caller, $tests ) = @_;
-    my @subs = @Test::More::EXPORT;
-    for my $sub ( @subs ) {
-        no strict 'refs';
-        no warnings 'redefine';
-        no warnings 'prototype';
-        *{ $caller . '::' . $sub } = sub {
-            my @params = @_;
-            my ( $package, $filename, $line ) = caller();
-            $tests->{ $sub } ||= [];
-            push @{ $tests->{ $sub }} => {
-                'caller' => {
-                    'package' => $package,
-                    filename  => $filename,
-                    line      => $line,
-                },
-                params => \@params
-            };
+=item make_test_fork_safe( $package, $sub )
+
+Make $sub from $package work in a forked process.
+
+=cut
+
+sub make_test_fork_safe {
+    my ( $package, $sub, $caller ) = @_;
+    ( $caller ) = caller() unless $caller;
+    my $code;
+    unless ( $code = $OVERRIDES{ $package }{ $sub }{ override } ) {
+        {
+            no strict 'refs';
+            $OVERRIDES{ $package }{ $sub }{ original } = \&{ $package . '::' . $sub };
         }
+        $code = sub {
+            # Run original if we are not in a child state.
+            goto &{ $OVERRIDES{ $package }{ $sub }{ original }} if $STATE eq 'parent';
+
+            my @params = @_;
+            my ( $caller, $filename, $line ) = caller();
+            _write( Dumper([
+                [ $package, $sub ],
+                {
+                    'caller' => {
+                        'package' => $caller,
+                        filename  => $filename,
+                        line      => $line,
+                    },
+                    params => \@params
+                }
+            ]));
+            "Test delayed";
+        };
+        $OVERRIDES{ $package }{ $sub }{ override } = $code;
+        _do_override( $package, $sub, $code );
+    }
+    _do_override( $caller, $sub, $code ) if $caller and $caller ne __PACKAGE__;
+}
+
+=item_tests_fork_safe( $package => \@subs, $package2 => \@subs2 )
+
+Same as make_test_fork_safe except for many subs/packages.
+
+=cut
+
+sub make_tests_fork_safe {
+    my %params = @_;
+    my ( $caller ) = delete( $params{ 'caller' } ) || caller();
+    while ( my ( $package, $subs ) = each %params ) {
+        make_test_fork_safe( $package, $_, $caller ) for @$subs;
     }
 }
 
 sub _run_tests {
     my ( $tests ) = @_;
-    $tests =~ s/$SEPERATOR//;
     {
         no strict;
-        $tests = eval $tests;
-        die( $@ ) if $@;
+        $tests = [ map {
+            $out = eval $_;
+            die $@ if $@;
+            $out
+        } split( $SEPERATOR, $tests )];
     }
 
-    for my $sub ( keys %$tests ) {
+    for my $test ( @$tests ) {
+        my ( $psub, $data ) = @$test;
+        my ( $package, $sub ) = @$psub;
+        my ( $caller, $params ) = @$data{qw/caller params/};
         no strict 'refs';
-        while ( my $test = shift( @{ $tests->{ $sub }})) {
-            my ( $caller, $params ) = @$test{qw/caller params/};
-            &$sub( @$params )
-                || diag( "Failure was at: " . $caller->{ filename } . " line: " . $caller->{ line });
-        }
+        eval { $OVERRIDES{ $package }{ $sub }{ original }->( @$params )}
+            || diag( "Failure was at: " . $caller->{ filename } . " line: " . $caller->{ line });
+        diag $@ if $@;
     }
+    return $tests;
+}
+
+sub _do_override {
+    my ( $package, $sub, $code ) = @_;
+    no strict 'refs';
+    no warnings 'redefine';
+    no warnings 'prototype';
+    return unless defined( &{ $package . '::' . $sub });
+    *{ $package . '::' . $sub } = $code;
+}
+
+sub _read {
+    local $/ = $SEPERATOR;
+    my $data = <READ>;
+    return $data;
+}
+
+sub _write {
+    print WRITE $_ for @_;
+    1;
 }
 
 1;
